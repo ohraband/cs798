@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import random
+import statistics
+import re
+import math
+
+# ===============================
+# Assignment Benchmark Script
+# ===============================
+
+A3 = "./a3"          # PIR implementation
+S = 1000             # fixed record size
+RUNS = 5             # required number of iterations
+
+# -------------------------------
+# Utility helpers
+# -------------------------------
+def run(cmd, capture_cpu=False):
+    """Run a shell command. If capture_cpu=True, measure CPU time using /usr/bin/time."""
+    if not capture_cpu:
+        subprocess.run(cmd, shell=True, check=True)
+        return 0.0
+
+    full = f'/usr/bin/time -f "%U" {cmd}'
+    proc = subprocess.Popen(full, shell=True, stderr=subprocess.PIPE)
+    _, stderr = proc.communicate()
+    cpu = float(stderr.decode().strip())
+    return cpu
+
+def cleanup():
+    """Remove all generated temporary files."""
+    os.system("rm -f params-* *-query* response record")
+
+def create_db(db_file, r, s):
+    """Create a database with r records of size s bytes each."""
+    dirpath = os.path.dirname(os.path.abspath(db_file))
+    os.makedirs(dirpath, exist_ok=True)
+
+    with open(db_file, "wb") as f:
+        for i in range(r):
+            txt = f"Record Index {i:03}: This is the retrieved data for record {i}. "
+            full = (txt * ((s // len(txt)) + 1))
+            data = full.encode()[:s].ljust(s, b' ')
+            f.write(data)
+
+def read_db_record(db_path, index):
+    """Read the record at index."""
+    with open(db_path, "rb") as f:
+        f.seek(index * S)
+        return f.read(S)
+
+def file_size(path):
+    return os.path.getsize(path) if os.path.exists(path) else 0
+
+# -------------------------------
+# Main benchmark
+# -------------------------------
+def bench(mode, R, db_file):
+    mode_l = mode.lower()
+    mode_l = mode.strip().lower()
+    #print("Mode: ",mode_l)
+    # ============================
+    # Parse the mode
+    # ============================
+    if mode_l in ["basic", "eqtest"]:
+        base_mode = mode_l
+        K = None
+    else:
+        m = re.match(r"(cw|pcw)(\d+)", mode_l)
+        if not m:
+            print(f"ERROR: Invalid mode '{mode}'", file=sys.stderr)
+            sys.exit(1)
+        base_mode = m.group(1)
+        K = int(m.group(2))
+
+    param_sizes = []
+    query_sizes = []
+    cpu_times = []
+
+    try:
+        for run_idx in range(RUNS):
+            #print(f"=== RUN {run_idx + 1}/{RUNS} ===", file=sys.stderr)
+
+            cleanup()
+
+            # ==========================================
+            # Use existing DB if provided (e.g., /db/wiki_db)
+            # ==========================================
+            if not os.path.exists(db_file):
+                create_db(db_file, R, S)
+
+            # Random index
+            i = random.randint(0, R - 1)
+
+            # ==========================================
+            # QUERY PHASE
+            # ==========================================
+            if base_mode in ["basic", "eqtest"]:
+                run(f'{A3} {base_mode}-query {R} {S} {i}')
+            elif base_mode == "pcw":
+                run(f'{A3} pcw-query {R} {S} {i} {K}')
+            else:
+                run(f'{A3} {base_mode}-query {R} {S} {i} {K}')
+
+            # ============================
+            # Detect generated query files
+            # ============================
+            if base_mode == "basic":
+                expected = [f"basic-query.{j}" for j in range(R)]
+            elif base_mode == "eqtest":
+                L = math.ceil(math.log2(R))
+                expected = [f"eqtest-query.{j}" for j in range(L)]
+            elif base_mode == "pcw":
+                expected = [f"pcw-query"]
+            else:
+                # cwK
+                expected = []
+                j = 0
+                while os.path.exists(f"{base_mode}-query.{j}"):
+                    expected.append(f"{base_mode}-query.{j}")
+                    j += 1
+
+            # Validate query files
+            for qf in expected:
+                if not os.path.exists(qf):
+                    print(f"ERROR: Missing expected query file: {qf}", file=sys.stderr)
+                    sys.exit(1)
+
+            qsize = sum(file_size(f) for f in expected)
+
+            # ==========================================
+            # PARAMETER SIZES
+            # ==========================================
+            psize = file_size("params-ctx") + file_size("params-multkey")
+
+            # ==========================================
+            # RESPOND PHASE
+            # ==========================================
+            if base_mode in ["basic", "eqtest"]:
+                cpu = run(f'{A3} {base_mode}-respond {R} {S} {db_file}', capture_cpu=True)
+            elif base_mode == "pcw":
+                cpu = run(f'{A3} pcw-respond {R} {S} {db_file} {K}', capture_cpu=True)
+            else:
+                cpu = run(f'{A3} {base_mode}-respond {R} {S} {db_file} {K}', capture_cpu=True)
+
+            if not os.path.exists("response"):
+                print("ERROR: response file not generated!", file=sys.stderr)
+                sys.exit(1)
+
+            # ==========================================
+            # RECONSTRUCT PHASE
+            # ==========================================
+            run(f'{A3} reconstruct {S}')
+            if not os.path.exists("record"):
+                print("ERROR: record file not generated!", file=sys.stderr)
+                sys.exit(1)
+
+            expected_data = read_db_record(db_file, i)
+            actual_data = open("record", "rb").read()
+            if expected_data != actual_data:
+                print("INCORRECT RECORD")
+                sys.exit(1)
+
+            param_sizes.append(psize)
+            query_sizes.append(qsize)
+            cpu_times.append(cpu)
+
+    finally:
+        cleanup()
+
+    # ==========================================
+    # OUTPUT STATS
+    # ==========================================
+    ps_mean = statistics.mean(param_sizes)
+    ps_std  = statistics.stdev(param_sizes) if RUNS > 1 else 0.0
+    qs_mean = statistics.mean(query_sizes)
+    qs_std  = statistics.stdev(query_sizes) if RUNS > 1 else 0.0
+    ct_mean = statistics.mean(cpu_times)
+    ct_std  = statistics.stdev(cpu_times) if RUNS > 1 else 0.0
+
+    print(f"{mode},{R},{ps_mean},{ps_std},{qs_mean},{qs_std},{ct_mean},{ct_std}")
+
+
+# -------------------------------
+# Entry point
+# -------------------------------
+if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        print("Usage: bench-experiment <mode> <R> <db_file>")
+        sys.exit(1)
+
+    mode = sys.argv[1]
+    R = int(sys.argv[2])
+    db_file = sys.argv[3]
+
+    bench(mode, R, db_file)

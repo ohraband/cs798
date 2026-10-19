@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+import hashlib
+import os
+import sys
+import math
+from typing import List, Tuple, Dict, Any
+
+def random_bytes(n: int) -> bytes:
+    return os.urandom(n)
+
+def xor_bytes(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b))
+
+def bit_vector_to_bytes(r: int, bit_vector: List[int]) -> bytes:
+    #Converts an r-length list of bits (0s and 1s) into the specific little-endian byte format required for the query file.
+
+    num_bytes = math.ceil(r / 8)
+    byte_list = bytearray(num_bytes)
+    
+    for i in range(r):
+        if bit_vector[i] == 1:
+            byte_index = i // 8
+            bit_in_byte = i % 8
+            byte_list[byte_index] |= (1 << bit_in_byte)
+            
+    return bytes(byte_list)
+
+def bytes_to_bit_vector(r: int, byte_data: bytes) -> List[int]:
+    #Converts the query file bytes back into an r-length list of bits (0s and 1s).
+
+    bit_vector = [0] * r
+
+    num_bytes = math.ceil(r / 8)
+    if len(byte_data) < num_bytes:
+        # Pad with zeros if necessary safety
+        byte_data = byte_data + b'\x00' * (num_bytes - len(byte_data))
+        
+    for i in range(r):
+        byte_index = i // 8
+        bit_in_byte = i % 8
+        
+        #check the corresponding bit
+        if (byte_data[byte_index] >> bit_in_byte) & 1:
+            bit_vector[i] = 1
+            
+    return bit_vector
+
+
+def prg(seed: bytes):
+
+    h = hashlib.sha512(seed).digest()
+    Lseed = h[:16] 
+    Lflag = h[16] & 1 
+    Rseed = h[17:33]
+    Rflag = h[33] & 1
+
+    return (Lseed, Lflag, Rseed, Rflag)
+
+def Gen(r, a, b=1):
+    #Generate function.
+    #r: domain size 
+    #a: target index (0 <= a < r)
+    #b: in binary always 1
+
+    n = r.bit_length() - 1  # tree depth
+    s0 = os.urandom(16) #seeds
+    s1 = os.urandom(16)
+    t0 = 0 #flags
+    t1 = 1  
+
+    s_orig0 = s0
+    s_orig1 = s1
+
+    cw = []
+
+    a_bits = [(a >> (n - 1 - j)) & 1 for j in range(n)]
+
+    for j in range(n):
+        
+        L0, fL0, R0, fR0 = prg(s0)
+        L1, fL1, R1, fR1 = prg(s1)
+
+        aj = a_bits[j]
+        
+        #calculate cw (sc, fc0, fc1)
+        if aj == 1: # a goes right
+            sc = xor_bytes(L0, L1)
+            fc0 = fL0 ^ fL1 
+            fc1 = fR0 ^ fR1 ^ 1
+        else: # a goes left
+            sc = xor_bytes(R0, R1)
+            fc0 = fL0 ^ fL1 ^ 1
+            fc1 = fR0 ^ fR1
+
+        cw.append((sc, fc0, fc1))
+
+        # apply correction if flag 
+        if t0: 
+            L0 = xor_bytes(L0, sc)
+            R0 = xor_bytes(R0, sc)
+            fL0 ^= fc0 
+            fR0 ^= fc1
+        if t1:
+            L1 = xor_bytes(L1, sc)
+            R1 = xor_bytes(R1, sc)
+            fL1 ^= fc0 
+            fR1 ^= fc1
+
+        # update seeds flags nodes based on the relevant path
+        if aj == 0: # a goes left
+            s0, t0 = L0, fL0
+            s1, t1 = L1, fL1
+        else: # a goes right
+            s0, t0 = R0, fR0
+            s1, t1 = R1, fR1
+            
+    key0 = (s_orig0, cw)
+    key1 = (s_orig1, cw)
+
+    return key0, key1
+
+def Eval(beta, key, i):
+    #Evaluate for server beta at point i.
+
+    s, cw = key
+    t = beta  #flag given
+    n = len(cw) #tree depth
+    i_bits = [(i >> (n - 1 - j)) & 1 for j in range(n)]
+
+    for k in range(n):
+        #essentailly build the tree again
+        L, fL, R, fR = prg(s) 
+        sc, fc0, fc1 = cw[k]
+
+        # if flag correction
+        if t:
+            L = xor_bytes(L, sc)
+            R = xor_bytes(R, sc)
+            fL ^= fc0
+            fR ^= fc1
+
+        # go left or right
+        if i_bits[k] == 0:
+            s, t = L, fL
+        else:
+            s, t = R, fR
+
+    return t # Final flag bit
+
+
+def chor_queries(r: int, s: int, i: int):
+
+    r_bits = r
+
+    rand_bytes = random_bytes(math.ceil(r_bits / 8))
+    q0_bits = bytes_to_bit_vector(r_bits, rand_bytes)[:r] 
+    
+    q1_bits = list(q0_bits)
+    q1_bits[i] = 1 - q1_bits[i] # Flip the bit at the queried index i
+    
+    #save files
+    q0_bytes = bit_vector_to_bytes(r, q0_bits)
+    with open('chor-query.0', 'wb') as f:
+        f.write(q0_bytes)
+        
+    q1_bytes = bit_vector_to_bytes(r, q1_bits)
+    with open('chor-query.1', 'wb') as f:
+        f.write(q1_bytes)
+        
+
+def chor_respond(beta: int, r: int, s: int, db_file: str):
+    query_file = f'chor-query.{beta}'
+    response_file = f'chor-response.{beta}'
+    
+    try:
+        with open(query_file, 'rb') as f:
+            query_bytes = f.read()
+    except FileNotFoundError:
+        sys.stderr.write(f"Error: Query file not found.\n")
+        sys.exit(1)
+        
+    q_bits = bytes_to_bit_vector(r, query_bytes)
+    
+    try:
+        with open(db_file, 'rb') as f:
+            db_data = f.read()
+    except FileNotFoundError:
+        sys.stderr.write(f"Error: Database file not found.\n")
+        sys.exit(1)
+        
+    response = bytes(s) #start with bytes of zero
+    
+    for j in range(r):
+        if q_bits[j] == 1:
+            record_j = db_data[j*s : (j+1)*s]
+            response = xor_bytes(response, record_j)
+            
+    with open(response_file, 'wb') as f:
+        f.write(response)
+
+
+def chor_reconstruct(r: int, s: int, i: int):
+    try:
+        with open('chor-response.0', 'rb') as f: r0 = f.read()
+        with open('chor-response.1', 'rb') as f: r1 = f.read()
+    except FileNotFoundError:
+        sys.stderr.write("Error: One or both response files not found.\n")
+        sys.exit(1)
+        
+    if len(r0) != s or len(r1) != s:
+        sys.stderr.write("Error: Response files are not the correct size (s bytes).\n")
+        sys.exit(1)
+
+    final_record = xor_bytes(r0, r1)
+    
+    with open('chor-record', 'wb') as f:
+        f.write(final_record)
+
+
+def dpfi_queries(r: int, s: int, i: int):
+    # r is  domain size, i is index
+    key0, key1 = Gen(r, i)
+    
+    #format according to assignment
+    def format_key(key):
+        s_orig, cw = key
+        output = s_orig 
+        for sc, fc0, fc1 in cw:
+            output += sc 
+            output += bytes([(fc0 & 1) | ((fc1 & 1) << 1)])
+        return output
+    
+    with open('dpfi-query.0', 'wb') as f: f.write(format_key(key0))
+    with open('dpfi-query.1', 'wb') as f: f.write(format_key(key1))
+
+def dpfi_respond(beta: int, r: int, s: int, db_file: str):
+    query_file = f'dpfi-query.{beta}'
+    
+    with open(query_file, 'rb') as f: key_bytes = f.read()
+
+    n = r.bit_length() - 1 #path is 1 smaller than len
+    s_orig = key_bytes[:16]
+    cw = []
+    #unpack key
+    for k in range(n):
+        start = 16 + k * 17
+        sc = key_bytes[start:start+16]
+        flag_byte = key_bytes[start+16]
+        cw.append((sc, flag_byte & 1, (flag_byte >> 1) & 1))
+    key = (s_orig, cw)
+
+    with open(db_file, 'rb') as f: db_data = f.read()
+
+    response = b'\x00' * s #zeros
+    for i in range(r):
+        v = Eval(beta, key, i)
+        if v == 1:
+            record_start = i * s
+            record = db_data[record_start:record_start + s]
+            if len(record) == s:
+                response = xor_bytes(response, record)
+
+    with open(f'dpfi-response.{beta}', 'wb') as f: f.write(response)
+
+def dpfi_reconstruct(r: int, s: int, i: int): 
+    with open('dpfi-response.0', 'rb') as f0, open('dpfi-response.1', 'rb') as f1:
+        resp0 = f0.read()
+        resp1 = f1.read()
+
+    record = xor_bytes(resp0, resp1)
+        
+    with open("dpfi-record", 'wb') as f:
+        f.write(record)
+
+
+def hash_keyword(w: str, d: int) -> Tuple[bytes, int]:
+    #full hash
+    full_hash = hashlib.sha256(w.encode()).digest() 
+    
+    #bytes needed
+    num_bytes_required = math.ceil(d / 8)
+    
+    #copy required bytes
+    truncated_bytes_list = list(full_hash[:num_bytes_required])
+    
+    #endianness paranoia below, liekly unncessary
+    #check if the last byte is only partially used
+    bits_in_last_byte = d % 8
+    
+    if bits_in_last_byte != 0 and num_bytes_required > 0:
+        #create a mask for the last byte
+        mask = (1 << bits_in_last_byte) - 1
+        
+        #mask the last byte, so now it has zeros everywhere else
+        last_byte_index = num_bytes_required - 1
+        truncated_bytes_list[last_byte_index] &= mask
+        
+    # convert the clean bits to little endian
+    hd_w_int = int.from_bytes(bytes(truncated_bytes_list), byteorder='little')
+    
+    return full_hash, hd_w_int
+
+
+def dpfk_queries(d: int, s: int, w: str):
+    #get truncated hash
+    _, hd_w = hash_keyword(w, d)
+    
+    #generate same as before just diffrent parameters
+    r_dpf = 1 << d
+    key0, key1 = Gen(r_dpf, hd_w)
+    
+    def format_key(key):
+        s_orig, cw = key
+        output = s_orig 
+        for sc, fc0, fc1 in cw:
+            output += sc 
+            output += bytes([(fc0 & 1) | ((fc1 & 1) << 1)])
+        return output
+    
+    with open('dpfk-query.0', 'wb') as f: f.write(format_key(key0))
+    with open('dpfk-query.1', 'wb') as f: f.write(format_key(key1))
+
+def dpfk_respond(beta: int, d: int, r: int, s: int, db_file: str, kw_file: str):
+    query_file = f'dpfk-query.{beta}'
+    
+    with open(query_file, 'rb') as f: key_bytes = f.read()
+
+    n = d #d bits
+    s_orig = key_bytes[:16]
+    cw = []
+    #pass the key correctly
+    for k in range(n):
+        start = 16 + k * 17
+        sc = key_bytes[start:start+16]
+        flag_byte = key_bytes[start+16]
+        cw.append((sc, flag_byte & 1, (flag_byte >> 1) & 1))
+    key = (s_orig, cw)
+
+    with open(db_file, 'rb') as f: db_data = f.read()
+    with open(kw_file, 'r') as f: keywords = [line.strip() for line in f]
+    
+    #if len(keywords) != r or len(db_data) != r * s:
+        #print("Mismatch in record count or file size.\n")
+
+
+    #compute response
+    record_size_V = 32 + s #sha 256 is 32 bytes
+    response = b'\x00' * record_size_V
+    
+    for i in range(r):
+        #get keyword
+        kw = keywords[i]
+
+        #get record from db
+        record_v = db_data[i * s : (i + 1) * s] 
+        
+        #compute hash and eval
+        h_wi, hd_wi = hash_keyword(kw, d)
+        v_eval = Eval(beta, key, hd_wi)
+        
+        #if we care
+        if v_eval == 1:
+            #|| bytes to V(w)
+            record_V = h_wi + record_v
+            #response xor
+            response = xor_bytes(response, record_V)
+            
+    with open(f'dpfk-response.{beta}', 'wb') as f: f.write(response)
+
+
+
+def dpfk_reconstruct(d: int, s: int, w: str): 
+    try:
+        with open('dpfk-response.0', 'rb') as f0: resp0 = f0.read()
+        with open('dpfk-response.1', 'rb') as f1: resp1 = f1.read()
+    except FileNotFoundError:
+        sys.stderr.write("Error: One or both response files not found.\n")
+        sys.exit(1)
+        
+    record_size_V = 32 + s 
+    
+    if len(resp0) != record_size_V or len(resp1) != record_size_V:
+        print("Response files are not the correct size (32 + s).\n")
+
+    reconstructed_V = xor_bytes(resp0, resp1)
+    
+    #check if the reconstructed result starts with H(w)
+    h_w, _ = hash_keyword(w, d) 
+    
+    # hash part
+    reconstructed_hash = reconstructed_V[:32]
+    
+    if reconstructed_hash == h_w:
+        print("keyword found")
+        #word part
+        final_record_v = reconstructed_V[32:]
+        
+        with open("dpfk-record", 'wb') as f:
+            f.write(final_record_v)
+    else:
+        print("keyword not found")
+        #dont do anything
+
+def main():
+    #main commands here
+    
+    if len(sys.argv) < 2:
+        print("Usage: a2 <command> [args...]", file=sys.stderr)
+        sys.exit(1)
+
+    command = sys.argv[1]
+    args = sys.argv[2:]
+
+    # CHOR
+    if command == 'chor-queries':
+        # Usage: a2 chor-queries r s i
+        r, s, i = map(int, args[:3])
+        chor_queries(r, s, i)
+
+    elif command == 'chor-respond':
+        # Usage: a2 chor-respond beta r s db_file
+        beta, r, s = map(int, args[:3])
+        db_file = args[3]
+        chor_respond(beta, r, s, db_file)
+
+    elif command == 'chor-reconstruct':
+        # Usage: a2 chor-reconstruct r s i
+        r, s, i = map(int, args[:3])
+        chor_reconstruct(r, s, i)
+        
+    # DPFI
+    elif command == 'dpfi-queries':
+        # Usage: a2 dpfi-queries r s i
+        r, s, i = map(int, args[:3])
+        dpfi_queries(r, s, i)
+
+    elif command == 'dpfi-respond':
+        # Usage: a2 dpfi-respond beta r s db_file
+        beta, r, s = map(int, args[:3])
+        db_file = args[3]
+        dpfi_respond(beta, r, s, db_file)
+
+    elif command == 'dpfi-reconstruct':
+        # Usage: a2 dpfi-reconstruct r s i
+        r, s, i = map(int, args[:3])
+        dpfi_reconstruct(r, s, i)
+        
+    # DPFK
+    elif command == 'dpfk-queries':
+        # Usage: a2 dpfk-queries d s w
+        d, s = map(int, args[:2])
+        w = args[2]
+        dpfk_queries(d, s, w)
+
+    elif command == 'dpfk-respond':
+        # Usage: a2 dpfk-respond beta d r s db_file kw_file
+        beta, d, r, s = map(int, args[:4])
+        db_file = args[4]
+        kw_file = args[5]
+        dpfk_respond(beta, d, r, s, db_file, kw_file)
+
+    elif command == 'dpfk-reconstruct':
+        # Usage: a2 dpfk-reconstruct d s w
+        d, s = map(int, args[:2])
+        w = args[2]
+        dpfk_reconstruct(d, s, w)
+        
+    else:
+        sys.stderr.write(f"Error: Unknown command '{command}'.\n")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

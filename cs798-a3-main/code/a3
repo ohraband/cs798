@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+
+from openfhe import *
+import sys
+import math
+import os
+
+def fhe_init(mult_depth):
+    """Initialize a crypto context and generate a public key and
+    multiplication key (the multiplication key is returned as part of the
+    crypto context)"""
+    parameters = CCParamsBFVRNS()
+    parameters.SetPlaintextModulus(65537)
+    parameters.SetMultiplicativeDepth(mult_depth)
+
+    ctx = GenCryptoContext(parameters)
+    ctx.Enable(PKESchemeFeature.PKE)
+    ctx.Enable(PKESchemeFeature.LEVELEDSHE)
+
+    keypair = ctx.KeyGen()
+    ctx.EvalMultKeyGen(keypair.secretKey)
+
+    return ctx, keypair
+
+def gen_subs_keys(ctx, privkey, c):
+    """Generate the public keys needed for the substitution operation
+    in order to perform an oblivious expansion of up to 2^c
+    coefficients"""
+
+    # The degree of the polynomial modulus of the ring we're working in;
+    # the ring is Z_65537/(x^N + 1).
+    N = ctx.GetCyclotomicOrder() >> 1
+
+    # The substitution indices we'll need
+    idxlist = [ (N>>i) + 1 for i in range(c) ]
+
+    ctx.EvalAutomorphismKeyGen(privkey, idxlist)
+
+def sub(ctx, r, ciphertext):
+    """Compute the substitution transformation x -> x^r on the given
+    ciphertext"""
+    automorphism_keys = ctx.GetEvalAutomorphismKeyMap(ciphertext.GetKeyTag())
+    return ctx.EvalAutomorphism(ciphertext, r, automorphism_keys)
+
+def serialize_pubparams(ctx):
+    """Serialize the public parameters (crypto context, multiplication
+    key) to files"""
+    SerializeToFile("params-ctx", ctx, BINARY)
+    ctx.SerializeEvalMultKey("params-multkey", BINARY)
+
+def deserialize_pubparams():
+    """Deserialize the public parameters from files"""
+    ctx, err = DeserializeCryptoContext("params-ctx", BINARY)
+    ctx.DeserializeEvalMultKey("params-multkey", BINARY)
+
+    return ctx
+
+def encrypt_int(ctx, pubkey, plaintext_int):
+    """Encrypt a plaintext that is just an integer; that is, the plaintext
+    is a polynomial whose constant term is plaintext_int and whose
+    remaining coefficients are all 0"""
+    plaintext_poly = ctx.MakeCoefPackedPlaintext([plaintext_int])
+    ciphertext = ctx.Encrypt(pubkey, plaintext_poly)
+    return ciphertext
+
+def next_record(db, ctx, s):
+    """Read the next record of s bytes from the database and format it
+    as a Plaintext"""
+    recbytes = db.read(s)
+    #failsafe for EOF
+    if not recbytes:
+        return None 
+    coeffs = [ x for x in recbytes ]
+    return ctx.MakeCoefPackedPlaintext(coeffs)
+
+def write_record(filename, plaintext, s):
+    """
+    Write the s bytes encoded in the Plaintext record to the given
+    output file.
+    """
+    with open(filename, "wb") as ofile:
+        coeffs = plaintext.GetCoefPackedValue()
+        
+        record_coeffs = coeffs[0:s]
+
+        #mod 256 just in case
+        output_bytes = bytes(c % 256 for c in record_coeffs)
+        
+        ofile.write(output_bytes)
+
+def nCr(n, r):
+    """Calculates nCr (n choose r)"""
+    if n < r or r < 0:
+        return 0
+    return math.comb(n, r)
+
+
+argc = len(sys.argv)
+
+if argc > 4 and sys.argv[1] == "basic-query":
+    r = int(sys.argv[2])
+    # s = int(sys.argv[3])
+    i = int(sys.argv[4])
+
+    #depth 1
+    ctx, keypair = fhe_init(1) 
+
+    serialize_pubparams(ctx)
+
+    SerializeToFile("pubkey", keypair.publicKey, BINARY)
+    SerializeToFile("privkey", keypair.secretKey, BINARY)
+
+    #generate r encrypted queries
+    for j in range(r):
+        val = 1 if j == i else 0
+        ciphertext = encrypt_int(ctx, keypair.publicKey, val)
+        SerializeToFile(f"basic-query.{j}", ciphertext, BINARY)
+
+elif argc > 4 and sys.argv[1] == "basic-respond":
+    r = int(sys.argv[2])
+    s = int(sys.argv[3])
+    db_file = sys.argv[4]
+
+    ctx = deserialize_pubparams()
+
+    #read the database
+    with open(db_file, "rb") as db:
+        response = None
+        for j in range(r):
+            #deserialize the each query
+            query_ct, err = DeserializeCiphertext(f"basic-query.{j}", BINARY)
+            #read the record from database as plaintext
+            record_pt = next_record(db, ctx, s)
+            if record_pt is None: 
+                break
+            #multiply query by record
+            prod_ct = ctx.EvalMult(query_ct, record_pt)
+            #add to total
+            if response is None:
+                response = prod_ct
+            else:
+                response = ctx.EvalAdd(response, prod_ct)
+
+    SerializeToFile("response", response, BINARY)
+
+
+elif argc > 4 and sys.argv[1] == "eqtest-query":
+    r = int(sys.argv[2])
+    s = int(sys.argv[3])
+    i = int(sys.argv[4])
+
+    #log2(r) depth
+    L = math.ceil(math.log2(r))
+    
+    ctx, keypair = fhe_init(L)
+
+    serialize_pubparams(ctx)
+    SerializeToFile("pubkey", keypair.publicKey, BINARY)
+    SerializeToFile("privkey", keypair.secretKey, BINARY)
+
+    #generate log2(r) encrypted queries for the bits of i
+    for k in range(L):
+        i_k = (i >> k) & 1 #k-th least significant bit of i
+        ciphertext = encrypt_int(ctx, keypair.publicKey, i_k)
+        SerializeToFile(f"eqtest-query.{k}", ciphertext, BINARY)
+elif argc > 4 and sys.argv[1] == "eqtest-respond":
+    r = int(sys.argv[2])
+    s = int(sys.argv[3])
+    db_file = sys.argv[4]
+
+    L = math.ceil(math.log2(r))
+    ctx = deserialize_pubparams()
+
+    # Load encrypted bits x[i] = C(i_i)
+    enc_bits = []
+    for k in range(L):
+        ct, _ = DeserializeCiphertext(f"eqtest-query.{k}", BINARY)
+        enc_bits.append(ct)
+
+    one_pt = ctx.MakeCoefPackedPlaintext([1])
+
+    response = None
+
+    with open(db_file, "rb") as db:
+        for j in range(r):
+
+            record_pt = next_record(db, ctx, s)
+            if record_pt is None:
+                break
+
+            eq_ct = None
+
+            for k in range(L):
+                y_k = (j >> k) & 1  # public bit
+
+                if y_k == 1:
+                    # use x[k]
+                    term = enc_bits[k]
+                else:
+                    # use (1 - x[k])
+                    term = ctx.EvalSub(one_pt, enc_bits[k])
+
+                if eq_ct is None:
+                    eq_ct = term
+                else:
+                    eq_ct = ctx.EvalMult(eq_ct, term)
+
+            #multiply equality result by record
+            prod_ct = ctx.EvalMult(eq_ct, record_pt)
+
+            if response is None:
+                response = prod_ct
+            else:
+                response = ctx.EvalAdd(response, prod_ct)
+
+    SerializeToFile("response", response, BINARY)
+
+
+elif argc > 5 and sys.argv[1] == "cw-query":
+    r = int(sys.argv[2]) 
+    s = int(sys.argv[3]) 
+    i = int(sys.argv[4])
+    k = int(sys.argv[5])
+
+    #calculate nCr(m, k) >= r
+    m = k
+    while nCr(m, k) < r:
+        m += 1
+
+    #depth log2(k) + 1
+    depth = math.ceil(math.log2(k)) + 1
+    ctx, keypair = fhe_init(depth)
+
+    serialize_pubparams(ctx)
+    SerializeToFile("pubkey", keypair.publicKey, BINARY)
+    SerializeToFile("privkey", keypair.secretKey, BINARY)
+
+    #algorithm 3
+    y = [0] * m
+    curr_val = i
+    curr_k = k
+
+    #generate the codewrods for all indexes
+    for j in range(m - 1, -1, -1): #go backwards
+        binom = nCr(j, curr_k)
+        
+        #algo 3 like assignment
+        if curr_val >= binom:
+            y[j] = 1
+            curr_val -= binom
+            curr_k -= 1
+        
+        #stop when all 1s placed
+        if curr_k == 0: 
+            break
+    
+    for idx, bit in enumerate(y):
+        ciphertext = encrypt_int(ctx, keypair.publicKey, bit)
+        SerializeToFile(f"cw-query.{idx}", ciphertext, BINARY)
+
+
+elif argc > 5 and sys.argv[1] == "cw-respond":
+    r = int(sys.argv[2])
+    s = int(sys.argv[3])
+    db_file = sys.argv[4]
+    k = int(sys.argv[5])
+
+    m = k
+    while nCr(m, k) < r:
+        m += 1
+    
+    c = math.ceil(math.log2(m))
+
+    ctx = deserialize_pubparams()
+
+    query_cts = []
+    for idx in range(m):
+        ct, _ = DeserializeCiphertext(f"cw-query.{idx}", BINARY)
+        query_cts.append(ct)
+
+    response = None
+
+    with open(db_file, "rb") as db:
+        for j in range(r):
+            record_pt = next_record(db, ctx, s)
+            if record_pt is None:
+                break
+
+            #construct codeword
+            curr_val = j
+            curr_k = k
+            indices_to_mult = [] #which positions are 1s
+
+            for bit_idx in range(m - 1, -1, -1):
+                binom = nCr(bit_idx, curr_k)
+                if curr_val >= binom:
+                    indices_to_mult.append(bit_idx)
+                    curr_val -= binom
+                    curr_k -= 1
+            
+            cts_to_multiply = [query_cts[idx] for idx in indices_to_mult]
+
+            #use a tree structure to reduce number of multiplications (real difference negligible)
+            current_cts = cts_to_multiply
+            
+            while len(current_cts) > 1:
+                next_cts = []
+                for i in range(0, len(current_cts), 2):
+                    ct1 = current_cts[i]
+                    if i + 1 < len(current_cts):
+                        ct2 = current_cts[i + 1]
+                        multiplied_ct = ctx.EvalMult(ct1, ct2)
+                        next_cts.append(multiplied_ct)
+                    else:
+                        next_cts.append(ct1) 
+                
+                current_cts = next_cts
+
+            #get equality ciphertext
+            if not current_cts:
+                 #just in case when k=0, since mult tree does not work there 
+                 eq_ct = ctx.MakeCoefPackedPlaintext([0])
+            else:
+                 eq_ct = current_cts[0]
+
+            prod_ct = ctx.EvalMult(eq_ct, record_pt)
+
+            if response is None:
+                response = prod_ct
+            else:
+                response = ctx.EvalAdd(response, prod_ct)
+
+    SerializeToFile("response", response, BINARY)
+
+
+elif argc > 2 and sys.argv[1] == "reconstruct":
+    s = int(sys.argv[2])
+
+    ctx = deserialize_pubparams()
+
+    privkey, err = DeserializePrivateKey("privkey", BINARY)
+
+    response, err = DeserializeCiphertext("response", BINARY)
+
+    result = ctx.Decrypt(privkey, response)
+
+    write_record("record", result, s)
+
+elif argc > 5 and sys.argv[1] == "pcw-query":
+    r = int(sys.argv[2])
+    s = int(sys.argv[3])
+    i = int(sys.argv[4])
+    k = int(sys.argv[5])
+
+    m = k
+    while nCr(m, k) < r:
+        m += 1
+    
+    c = math.ceil(math.log2(m))
+
+    depth = math.ceil(math.log2(k)) + 1
+    ctx, keypair = fhe_init(depth)
+
+    serialize_pubparams(ctx)
+    SerializeToFile("pubkey", keypair.publicKey, BINARY)
+    SerializeToFile("privkey", keypair.secretKey, BINARY)
+
+    gen_subs_keys(ctx, keypair.secretKey, c)
+    ctx.SerializeEvalAutomorphismKey("params-subskey", BINARY)
+
+    y = [0] * m
+    curr_val = i
+    curr_k = k
+    for j in range(m - 1, 0, -1):
+        binom = nCr(j, curr_k)
+        if curr_val >= binom:
+            y[j] = 1
+            curr_val -= binom
+            curr_k -= 1
+        else:
+            y[j] = 0
+    y[0] = curr_k
+    
+    inv_2 = 32769 #inverse of 2 mod 65537 is 32769
+    scale_factor = pow(inv_2, c, 65537)
+    
+    if scale_factor > 32768:
+        scale_factor -= 65537
+
+    #Algorithm 4
+    #polynomial init
+    N = ctx.GetCyclotomicOrder() >> 1
+    coeffs = [0] * N
+    
+    #fill polynomial
+    for idx, bit in enumerate(y):
+        if bit == 1:
+            coeffs[idx] = scale_factor
+    
+    #encrypt polynomial
+    plaintext = ctx.MakeCoefPackedPlaintext(coeffs)
+    ciphertext = ctx.Encrypt(keypair.publicKey, plaintext)
+    
+    SerializeToFile("pcw-query", ciphertext, BINARY)
+
+
+elif argc > 5 and sys.argv[1] == "pcw-respond":
+    r = int(sys.argv[2])
+    s = int(sys.argv[3])
+    db_file = sys.argv[4]
+    k = int(sys.argv[5])
+
+    m = k
+    while nCr(m, k) < r:
+        m += 1
+    c = math.ceil(math.log2(m))
+
+    ctx = deserialize_pubparams()
+    
+    ctx.DeserializeEvalAutomorphismKey("params-subskey", BINARY)
+
+    packed_ct, _ = DeserializeCiphertext("pcw-query", BINARY)
+
+    #algorithm 5
+    current_cts = [packed_ct]
+    N = ctx.GetCyclotomicOrder() >> 1 
+
+    for a in range(c):
+        cts_evens = [] #b
+        cts_odds = [] #b + 2^a
+        
+        shift_pow = 1 << a
+        
+        sub_idx = (N >> a) + 1 
+
+        rot_coeffs = [0] * N
+        rot_coeffs[N - shift_pow] = 1
+        rot_pt = ctx.MakeCoefPackedPlaintext(rot_coeffs)
+
+        for ct in current_cts:
+            c0 = sub(ctx, sub_idx, ct)
+
+            c1_temp = ctx.EvalMult(c0, rot_pt)
+            c1 = ctx.EvalNegate(c1_temp)
+
+            odd_init_temp = ctx.EvalMult(ct, rot_pt)
+            odd_init = ctx.EvalNegate(odd_init_temp)
+
+            ct_even = ctx.EvalAdd(ct, c0)
+            cts_evens.append(ct_even)
+
+            ct_odd = ctx.EvalSub(odd_init, c1)
+            cts_odds.append(ct_odd)
+
+        current_cts = cts_evens + cts_odds
+
+    expanded_query_cts = current_cts[:m]
+
+    #Same as cw
+    response = None
+
+    with open(db_file, "rb") as db:
+        for j in range(r):
+            record_pt = next_record(db, ctx, s)
+            if record_pt is None: break
+
+            curr_val = j
+            curr_k = k
+            indices_to_mult = []
+
+            for bit_idx in range(m - 1, -1, -1):
+                binom = nCr(bit_idx, curr_k)
+                if curr_val >= binom:
+                    indices_to_mult.append(bit_idx)
+                    curr_val -= binom
+                    curr_k -= 1
+
+            cts_to_multiply = [expanded_query_cts[idx] for idx in indices_to_mult]
+            
+            current_mult_layer = cts_to_multiply
+            
+            while len(current_mult_layer) > 1:
+                next_mult_layer = []
+                for i in range(0, len(current_mult_layer), 2):
+                    ct1 = current_mult_layer[i]
+                    if i + 1 < len(current_mult_layer):
+                        ct2 = current_mult_layer[i + 1]
+                        multiplied_ct = ctx.EvalMult(ct1, ct2)
+                        next_mult_layer.append(multiplied_ct)
+                    else:
+                        next_mult_layer.append(ct1)
+                current_mult_layer = next_mult_layer
+
+            if not current_mult_layer:
+                 eq_ct = ctx.MakeCoefPackedPlaintext([0]) 
+            else:
+                 eq_ct = current_mult_layer[0]
+
+            prod_ct = ctx.EvalMult(eq_ct, record_pt)
+
+            if response is None:
+                response = prod_ct
+            else:
+                response = ctx.EvalAdd(response, prod_ct)
+
+
+
+    SerializeToFile("response", response, BINARY)

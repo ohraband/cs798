@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+
+
+#docker run pya1 ./a1  
+import sys
+#print("Running Python executable:", sys.executable)
+
+from pysodium import *
+import struct
+import sys
+
+#print("Hello world!")
+crypto_scalarmult_ristretto255_BYTES = 32 #add the missing python definition (is it intercahnganbeable with scalarbytes?)
+
+
+# Convert the 64-bit unsigned integer n to a scalar (a little-endian
+# byte array of length crypto_core_ristretto255_SCALARBYTES)
+def int_to_scalar(n):
+    scalar = struct.pack('<Q', n) + \
+        bytes(crypto_core_ristretto255_SCALARBYTES - 8)
+    return scalar
+
+if sodium_init() < 0:
+    print("Cannot initialize libsodium", file=sys.stderr)
+    sys.exit(1)
+
+argc = len(sys.argv)
+
+if argc > 1 and sys.argv[1] == "randscalar":
+    r = crypto_core_ristretto255_scalar_random()
+    sys.stdout.buffer.write(r)
+
+elif argc > 1 and sys.argv[1] == "priv-to-pub":
+    priv = sys.stdin.buffer.read(crypto_core_ristretto255_SCALARBYTES)
+    pub = crypto_scalarmult_ristretto255_base(priv)
+    sys.stdout.buffer.write(pub)
+
+
+elif argc > 1 and sys.argv[1] == "dh":
+    alice_priv = crypto_core_ristretto255_scalar_random() 
+    alice_pub = crypto_scalarmult_ristretto255_base(alice_priv)
+    bob_pub = sys.stdin.buffer.read(crypto_scalarmult_ristretto255_BYTES)
+    #print(len(alice_priv))
+    #print("two")
+    #print(len(bob_pub))
+
+    if len(bob_pub) != crypto_scalarmult_ristretto255_BYTES:
+        print("Error: Expected 32-byte Bob public key on stdin", file=sys.stderr)
+        sys.exit(1)
+
+    shared_point = crypto_scalarmult_ristretto255(alice_priv, bob_pub)
+    shared_key = crypto_generichash(shared_point)
+    #print("shared_point_len 32?")
+    #print(len(shared_point))
+    sys.stdout.buffer.write(alice_pub)
+    sys.stdout.buffer.write(shared_key)
+
+elif argc > 1 and sys.argv[1] == "elgamal":
+    if argc < 3:
+        print("Incorrect number of arguments. Usage => elgamal plaintext", file=sys.stderr)
+        sys.exit(1)
+    plaintext = sys.argv[2].encode()
+    bob_pubkey = sys.stdin.buffer.read(crypto_core_ristretto255_SCALARBYTES)
+
+    if len(bob_pubkey) != crypto_core_ristretto255_SCALARBYTES:
+        print("Error: Expected 32-byte Bob public key from stdin", file=sys.stderr)
+        sys.exit(1)
+
+    alice_priv = crypto_core_ristretto255_scalar_random() 
+    alice_pub = crypto_scalarmult_ristretto255_base(alice_priv)
+    shared_point = crypto_scalarmult_ristretto255(alice_priv, bob_pubkey)
+    
+    shared_key = crypto_generichash(shared_point, outlen=crypto_secretbox_KEYBYTES)
+    nonce = randombytes(crypto_secretbox_NONCEBYTES)
+    ciphertext = crypto_secretbox(plaintext, nonce, shared_key)
+    
+    #print("plaintext")
+    #print(len(plaintext))
+    #print("cipthertext")
+    #print(len(ciphertext)) #should be + 16 
+    sys.stdout.buffer.write(alice_pub)
+    sys.stdout.buffer.write(nonce)
+    sys.stdout.buffer.write(ciphertext)
+
+elif argc > 1 and sys.argv[1] == "sss":
+    if argc != 4:
+        print("Incorrect number of arguments. Usage => sss n t", file=sys.stderr)
+        sys.exit(1)
+    try:
+        n = int(sys.argv[2])
+        t = int(sys.argv[3])
+    except (IndexError, ValueError):
+        print("Args 2 and 3 must be valid integers.")
+        sys.exit(1)
+
+    if not (1 <= t <= n):
+        print("Threshold t must be between 1 and n", file=sys.stderr)
+        sys.exit(1)
+
+    secret_bytes = sys.stdin.buffer.read(crypto_core_ristretto255_SCALARBYTES)
+    if len(secret_bytes) != crypto_core_ristretto255_SCALARBYTES:
+        print("Expected 32 byte secret scalar from stdin", file=sys.stderr)
+        sys.exit(1)
+    
+    coeffs = []
+    coeffs.append(secret_bytes)
+    for i in range(t - 1): #generate scalars for each power
+        coeffs.append(crypto_core_ristretto255_scalar_random())
+
+    for i in range(1, n + 1): #loop over all shares
+        x = int_to_scalar(i) #convert index to scalar compatible 32 byte version
+        x_pow = int_to_scalar(1) #set current power to 1, 32 byte version again
+        y = coeffs[0]  # start with a_0 (the secret)
+
+        for j in range(1, t): #copmute the value of the polynomial at the point x(i)
+            x_pow = crypto_core_ristretto255_scalar_mul(x_pow, x)  #get next power of x
+            term = crypto_core_ristretto255_scalar_mul(coeffs[j], x_pow) #multiply with correct scalar
+            y = crypto_core_ristretto255_scalar_add(y, term) #add to result of the polynomial
+
+
+        sys.stdout.buffer.write(y)
+
+elif argc > 1 and sys.argv[1] == "combine":
+    if argc < 3:
+        print("Incorrect number of arguments. Usage => combine x1 x2 ... xn", file=sys.stderr)
+        sys.exit(1)
+    
+    x_indices = list(map(int, sys.argv[2:] )) #convert to int and to list
+    t = len(x_indices) #our treshhold
+
+    shares = []
+    for i in range(t):
+        share = sys.stdin.buffer.read(crypto_core_ristretto255_SCALARBYTES)
+        if len(share) != crypto_core_ristretto255_SCALARBYTES:
+            print("Expected 32 byte share scalar from input", file=sys.stderr)
+            sys.exit(1)
+        shares.append(share)
+    
+    # is defined on top
+    # def int_to_scalar(x): #move this outside later on
+    #     return x.to_bytes(crypto_core_ristretto255_SCALARBYTES, 'little')
+
+
+    x_s = []
+    for x in x_indices:
+        scalar_x = int_to_scalar(x)
+        x_s.append(scalar_x)
+    
+    y_s = shares
+
+    secret = int_to_scalar(0) #hope this zero works
+
+    for i in range(t): #go over each share
+        numerator = int_to_scalar(1)
+        denominator = int_to_scalar(1)
+        for j in range(t): #calculate lambda for a share
+            if i == j:
+                continue
+            numerator = crypto_core_ristretto255_scalar_mul(numerator, x_s[j])
+            diff = crypto_core_ristretto255_scalar_sub(x_s[j], x_s[i])
+            denom_inv = crypto_core_ristretto255_scalar_invert(diff)
+            denominator = crypto_core_ristretto255_scalar_mul(denominator, denom_inv)
+
+        lambda_i = crypto_core_ristretto255_scalar_mul(numerator, denominator) #get lambda of a share
+        term = crypto_core_ristretto255_scalar_mul(y_s[i], lambda_i) #multiply with value y of the share
+        secret = crypto_core_ristretto255_scalar_add(secret, term) #add to total secret calculation
+
+    sys.stdout.buffer.write(secret)
+
+elif argc > 1 and sys.argv[1] == "zkp":
+    if argc < 3:
+        print("Incorrect number of arguments. Usage => zkp message", file=sys.stderr)
+        sys.exit(1)
+    message = sys.argv[2].encode()
+
+    priv = sys.stdin.buffer.read(crypto_core_ristretto255_SCALARBYTES)
+    if len(priv) != crypto_core_ristretto255_SCALARBYTES:
+        print("Expected a 32 byte private key scalar as ipnut", file=sys.stderr)
+        sys.exit(1)
+
+    A = crypto_scalarmult_ristretto255_base(priv)
+
+    r = crypto_core_ristretto255_scalar_random()
+    #r = A #break-schnorr purposes
+
+    R = crypto_scalarmult_ristretto255_base(r)
+
+    hash_input = R + A + message #plus works cause bytes
+    hash_output = crypto_hash_sha512(hash_input) 
+
+    c = crypto_core_ristretto255_scalar_reduce(hash_output)
+
+    ca = crypto_core_ristretto255_scalar_mul(c, priv)
+    z = crypto_core_ristretto255_scalar_add(r, ca) # z = r + c * a
+
+    sys.stdout.buffer.write(A)
+    sys.stdout.buffer.write(R)
+    sys.stdout.buffer.write(z)
+
+elif argc > 1 and sys.argv[1] == "break-schnorr":
+    if argc < 4:
+        print("Incorrect number of arguments. Usage => break-schnorr message1 message2", file=sys.stderr)
+        sys.exit(1)
+
+    message1 = sys.argv[2].encode()
+    message2 = sys.argv[3].encode()
+
+    A = sys.stdin.buffer.read(32)
+    R1 = sys.stdin.buffer.read(32)
+    z1 = sys.stdin.buffer.read(32)
+    R2 = sys.stdin.buffer.read(32)
+    z2 = sys.stdin.buffer.read(32)
+
+    if any(len(x) != 32 for x in [A, R1, z1, R2, z2]):
+        print("Expected five 32 byte values from input", file=sys.stderr)
+        sys.exit(1)
+
+    #get c1 and c2
+    c1_hash = crypto_hash_sha512(R1 + A + message1)
+    c2_hash = crypto_hash_sha512(R2 + A + message2)
+    c1 = crypto_core_ristretto255_scalar_reduce(c1_hash)
+    c2 = crypto_core_ristretto255_scalar_reduce(c2_hash)
+
+    #get z1 - z2 
+    z_diff = crypto_core_ristretto255_scalar_sub(z1, z2)
+    #get c1 - c2
+    c_diff = crypto_core_ristretto255_scalar_sub(c1, c2)
+
+    #no division operator, have to mutiply by inverse instead -> (c1 - c2)^-1
+    c_diff_inv = crypto_core_ristretto255_scalar_invert(c_diff)
+
+    #a = (z1 - z2) * (c1 - c2)^-1
+    a = crypto_core_ristretto255_scalar_mul(z_diff, c_diff_inv)
+
+    sys.stdout.buffer.write(a)
+
+else:
+    print("Unknown args", file=sys.stderr)
+
+

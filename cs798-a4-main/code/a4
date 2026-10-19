@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+import sys
+import random
+from collections import deque
+from math import log2, floor
+
+
+def load_dfa(dfa_file):
+    transitions = {}
+    accepting_states = set()
+    
+    with open(dfa_file, "r") as f:
+        lines = f.readlines()
+    
+    #Parsing input
+    parts = lines[0].strip().split()
+    num_states = int(parts[0])
+    accepting_states = set(int(s) for s in parts[1:])
+    
+    for i in range(num_states):
+        transitions[i] = {}
+    
+    #Create transitions lists
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        from_state, label_ascii, to_state = line.strip().split()
+        from_state = int(from_state)
+        label = int(label_ascii)
+        to_state = int(to_state)
+        transitions[from_state][label] = to_state
+    
+    return transitions, accepting_states
+
+def check_dfa(transitions, accepting_states, input_bytes):
+    state = 0
+    for b in input_bytes:
+        if isinstance(b, str):
+            b = ord(b) #convert to letter
+        if b in transitions[state]:
+            state = transitions[state][b]
+        else:
+            return False
+    return state in accepting_states
+
+def rand_generate(transitions, n):
+    state = 0
+    output = bytearray()
+    for _ in range(n):
+        outs = list(transitions[state].items())
+        if not outs:
+            break
+        label, next_state = random.choice(outs)
+        output.append(label)
+        state = next_state
+    return output, state
+
+def shortest_path_to_accept(transitions, accepting_states, start_state):
+    queue = deque() #BFS
+    queue.append((start_state, []))
+    visited = set()
+    visited.add(start_state)
+    
+    while queue:
+        state, path = queue.popleft()
+        if state in accepting_states:
+            return path
+        for label, next_state in transitions[state].items():
+            if next_state not in visited:
+                visited.add(next_state)
+                queue.append((next_state, path + [label]))
+    return []
+
+def randacc_generate(transitions, accepting_states, n):
+    output, end_state = rand_generate(transitions, n)
+    path_to_accept = shortest_path_to_accept(transitions, accepting_states, end_state)
+    output.extend(path_to_accept) #append but keep the elements separated, pretty much concatenate
+    return output
+
+
+class BitReader:
+    def __init__(self, data_bytes):
+        self.bits = []
+        for b in data_bytes:
+            for i in range(8):
+                self.bits.append((b >> i) & 1)  # low-bit first
+        # append NUL terminator
+        for i in range(8):
+            self.bits.append(0)
+        self.pos = 0
+
+    def read_bits(self, n):
+        val = 0
+        for i in range(n):
+            if self.pos < len(self.bits):
+                val |= self.bits[self.pos] << i
+            self.pos += 1
+        return val
+
+class BitWriter:
+    def __init__(self):
+        self.bits = []
+
+    def write_bits(self, val, n):
+        for i in range(n):
+            self.bits.append((val >> i) & 1)
+
+    def to_bytes(self):
+        out = bytearray()
+        for i in range(0, len(self.bits), 8):
+            byte = 0
+            for j in range(8):
+                if i + j < len(self.bits):
+                    byte |= self.bits[i + j] << j
+            out.append(byte)
+        return out
+
+
+def encode_dfa(transitions, accepting_states, covert_bytes):
+    reader = BitReader(covert_bytes)
+    state = 0
+    output = bytearray()
+
+    while True:
+        outs = sorted(transitions[state].items(), key=lambda x: -x[0])  # descending labels
+        t = len(outs)
+        if t == 0:
+            break
+
+        b = floor(log2(t))
+        k = reader.read_bits(b)
+        if k >= t:
+            k = t - 1
+
+        label, next_state = outs[k]
+        output.append(label)
+        state = next_state
+
+        if reader.pos >= len(reader.bits):
+            break
+
+    path_to_accept = shortest_path_to_accept(transitions, accepting_states, state)
+    output.extend(path_to_accept)
+    return output
+
+def decode_dfa(transitions, accepting_states, overt_bytes):
+    state = 0
+    bitstream = []
+
+    for label_taken in overt_bytes:
+        outs = sorted(transitions[state].items(), key=lambda x: -x[0])
+        t = len(outs)
+        if t == 0:
+            break
+        b = floor(log2(t))
+        k = next((i for i, (lbl, _) in enumerate(outs) if lbl == label_taken), None)
+        if k is None:
+            break
+        for i in range(b):
+            bitstream.append((k >> i) & 1)
+        state = transitions[state][label_taken]
+
+    output_bytes = bytearray()
+    for i in range(0, len(bitstream), 8):
+        byte = 0
+        for j in range(8):
+            if i + j < len(bitstream):
+                byte |= bitstream[i + j] << j
+        if byte == 0x00:
+            break
+        output_bytes.append(byte)
+
+    return output_bytes
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: ./a4 <command> dfa-file [n]")
+
+    cmd = sys.argv[1]
+    dfa_file = sys.argv[2]
+    transitions, accepting_states = load_dfa(dfa_file)
+
+    if cmd == "check":
+        input_bytes = sys.stdin.buffer.read()
+        if check_dfa(transitions, accepting_states, input_bytes):
+            print("Input accepted by the DFA")
+        else:
+            print("Input rejected by the DFA")
+
+    elif cmd == "rand":
+        if len(sys.argv) != 4:
+            print("Usage: ./a4 rand dfa-file n")
+        n = int(sys.argv[3])
+        output, _ = rand_generate(transitions, n)
+        sys.stdout.buffer.write(output)
+
+    elif cmd == "randacc":
+        if len(sys.argv) != 4:
+            print("Usage: ./a4 randacc dfa-file n")
+        n = int(sys.argv[3])
+        output = randacc_generate(transitions, accepting_states, n)
+        sys.stdout.buffer.write(output)
+
+    elif cmd == "encode":
+        covert_bytes = sys.stdin.buffer.read()
+        output = encode_dfa(transitions, accepting_states, covert_bytes)
+        sys.stdout.buffer.write(output)
+
+    elif cmd == "decode":
+        overt_bytes = sys.stdin.buffer.read()
+        output = decode_dfa(transitions, accepting_states, overt_bytes)
+        sys.stdout.buffer.write(output)
+
+    else:
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
